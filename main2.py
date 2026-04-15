@@ -295,12 +295,22 @@ st.markdown(f"""
       font-size: 0.8rem;
       color: {ACCENT_RED};
   }}
+  .insight-card {{
+      background: {BG_CARD2};
+      border: 1px solid {BORDER};
+      border-left: 3px solid {ACCENT_AMBER};
+      border-radius: 8px;
+      padding: 0.8rem 1.1rem;
+      margin: 0.5rem 0;
+      font-size: 0.85rem;
+      color: {TEXT_PRIMARY};
+  }}
 </style>
 """, unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HELPERS (sama seperti versi sebelumnya + tambahan xlsx)
+# HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def parse_dt(series):
@@ -337,14 +347,37 @@ def xlsx_to_csv_string(file_bytes):
     return "\n".join(rows)
 
 
+# ── Semua marker kolom peserta yang dikenali ─────────────────────────────────
+PESERTA_MARKERS = [
+    "Nama (nama asli)", "Name (Original Name)", "Name (original name)",
+    "Waktu bergabung",  "Join Time", "Join time",
+    "Waktu keluar",     "Leave Time", "Leave time",
+]
+
+
+def _find_split_line(raw: str, sep: str):
+    """
+    Cari baris yang merupakan header peserta di dalam raw CSV string.
+    Return index baris atau None jika tidak ditemukan (= format flat).
+    """
+    lines = raw.splitlines()
+    for i, line in enumerate(lines):
+        cells = [c.strip().strip('"').lower() for c in line.split(sep)]
+        if any(mk.lower() in cells for mk in PESERTA_MARKERS):
+            return i
+    return None
+
+
 def load_csv(file_or_stringio, filename="data.csv"):
     """
     Auto-detect dan load CSV/XLSX Zoom.
     Mendukung FORMAT FLAT dan FORMAT SPLIT.
+
+    FIX: menangani ParserError ketika bagian meeting dan peserta
+    punya jumlah kolom berbeda (format SPLIT).
     """
-    # ── Baca raw ──────────────────────────────────────────────────────────────
+    # ── Baca raw ──────────────────────────────────────────────────────────
     if hasattr(file_or_stringio, "read"):
-        # Cek apakah XLSX
         fname = getattr(file_or_stringio, "name", filename)
         if fname.lower().endswith(".xlsx"):
             raw_bytes = file_or_stringio.read()
@@ -360,74 +393,75 @@ def load_csv(file_or_stringio, filename="data.csv"):
     else:
         raw = file_or_stringio
 
-    sep    = detect_sep(raw)
-    df_try = pd.read_csv(StringIO(raw), sep=sep)
+    sep = detect_sep(raw)
 
-    PESERTA_MARKERS = [
-        "Nama (nama asli)", "Name (Original Name)", "Name (original name)",
-        "Waktu bergabung",  "Join Time", "Join time",
-        "Waktu keluar",     "Leave Time", "Leave time",
-    ]
+    # ── Cek split line DULU sebelum pd.read_csv ──────────────────────────
+    # Ini menghindari crash ParserError pada file SPLIT di mana
+    # meeting header (N kolom) ≠ peserta header (M kolom).
+    split_line_idx = _find_split_line(raw, sep)
+    lines = raw.splitlines()
 
-    if any(mk in list(df_try.columns) for mk in PESERTA_MARKERS):
-        return df_try, "flat"
+    if split_line_idx is not None and split_line_idx > 0:
+        # ── FORMAT SPLIT ─────────────────────────────────────────────────
+        # Parse bagian meeting (baris sebelum split) secara terpisah
+        meeting_lines = [l for l in lines[:split_line_idx] if l.strip()]
+        if meeting_lines:
+            df_meeting = pd.read_csv(StringIO("\n".join(meeting_lines)), sep=sep)
+            meeting_row = df_meeting.iloc[0] if len(df_meeting) > 0 else pd.Series(dtype=object)
+        else:
+            df_meeting = pd.DataFrame()
+            meeting_row = pd.Series(dtype=object)
 
-    cols_lower = {c.lower() for c in df_try.columns}
-    markers_lower = {mk.lower() for mk in PESERTA_MARKERS}
-    if cols_lower & markers_lower:
-        return df_try, "flat"
+        # Parse bagian peserta
+        peserta_raw = "\n".join(lines[split_line_idx:])
+        df_peserta  = pd.read_csv(StringIO(peserta_raw), sep=sep)
+        df_peserta.dropna(how="all", inplace=True)
+        df_peserta.reset_index(drop=True, inplace=True)
 
-    lines          = raw.splitlines()
-    split_line_idx = None
-    for i, line in enumerate(lines):
-        cells = [c.strip().strip('"').lower() for c in line.split(sep)]
-        if any(mk.lower() in cells for mk in PESERTA_MARKERS):
-            split_line_idx = i
-            break
+        # Rename kolom durasi peserta agar tidak bentrok dengan durasi meeting
+        DUR_PESERTA_NAMES = ["Durasi (menit)", "Duration (Minutes)", "Duration (minutes)"]
+        for dur_name in DUR_PESERTA_NAMES:
+            if dur_name in df_peserta.columns:
+                df_peserta.rename(columns={dur_name: dur_name + ".1"}, inplace=True)
+                break
 
-    if split_line_idx is None:
-        return df_try, "flat"
+        # Inject info meeting ke setiap baris peserta
+        MEETING_COL_MAP = {
+            "Topik":              "Topik",
+            "Topic":              "Topik",
+            "Host":               "Nama host",
+            "Nama host":          "Nama host",
+            "Host Name":          "Nama host",
+            "Host name":          "Nama host",
+            "Waktu mulai":        "Waktu mulai",
+            "Start Time":         "Waktu mulai",
+            "Start time":         "Waktu mulai",
+            "Waktu berakhir":     "Waktu berakhir",
+            "End Time":           "Waktu berakhir",
+            "End time":           "Waktu berakhir",
+            "Peserta":            "Peserta",
+            "Participants":       "Peserta",
+            "Durasi (menit)":     "Durasi (menit)",
+            "Duration (Minutes)": "Durasi (menit)",
+            "Duration (minutes)": "Durasi (menit)",
+            "ID":                 "ID",
+        }
+        for src_col, dst_col in MEETING_COL_MAP.items():
+            if src_col in df_meeting.columns:
+                val = meeting_row.get(src_col, None)
+                if val is not None and str(val).strip() not in ("", "nan"):
+                    df_peserta[dst_col] = val
 
-    meeting_row = df_try.iloc[0] if len(df_try) > 0 else pd.Series(dtype=object)
+        return df_peserta, "split"
 
-    peserta_raw = "\n".join(lines[split_line_idx:])
-    df_peserta  = pd.read_csv(StringIO(peserta_raw), sep=sep)
-    df_peserta.dropna(how="all", inplace=True)
-    df_peserta.reset_index(drop=True, inplace=True)
+    # ── FORMAT FLAT (atau tidak ditemukan split) ─────────────────────────
+    try:
+        df_try = pd.read_csv(StringIO(raw), sep=sep)
+    except pd.errors.ParserError:
+        # Fallback: skip bad lines
+        df_try = pd.read_csv(StringIO(raw), sep=sep, on_bad_lines="skip")
 
-    DUR_PESERTA_NAMES = ["Durasi (menit)", "Duration (Minutes)", "Duration (minutes)"]
-    for dur_name in DUR_PESERTA_NAMES:
-        if dur_name in df_peserta.columns:
-            df_peserta.rename(columns={dur_name: dur_name + ".1"}, inplace=True)
-            break
-
-    MEETING_COL_MAP = {
-        "Topik":              "Topik",
-        "Topic":              "Topik",
-        "Host":               "Nama host",
-        "Nama host":          "Nama host",
-        "Host Name":          "Nama host",
-        "Host name":          "Nama host",
-        "Waktu mulai":        "Waktu mulai",
-        "Start Time":         "Waktu mulai",
-        "Start time":         "Waktu mulai",
-        "Waktu berakhir":     "Waktu berakhir",
-        "End Time":           "Waktu berakhir",
-        "End time":           "Waktu berakhir",
-        "Peserta":            "Peserta",
-        "Participants":       "Peserta",
-        "Durasi (menit)":     "Durasi (menit)",
-        "Duration (Minutes)": "Durasi (menit)",
-        "Duration (minutes)": "Durasi (menit)",
-        "ID":                 "ID",
-    }
-    for src_col, dst_col in MEETING_COL_MAP.items():
-        if src_col in df_try.columns:
-            val = meeting_row.get(src_col, None)
-            if val is not None and str(val).strip() not in ("", "nan"):
-                df_peserta[dst_col] = val
-
-    return df_peserta, "split"
+    return df_try, "flat"
 
 
 def detect_cols(df):
@@ -493,41 +527,25 @@ PEMATERI_LENGKAP = [
 ]
 
 def _tokenize(s: str) -> set:
-    """Pecah string jadi set token huruf kecil, buang gelar/tanda baca."""
     import re
     s = s.lower()
-    # hapus gelar umum dan karakter non-alfanumerik
     s = re.sub(r"[^a-z0-9 ]", " ", s)
     tokens = {t for t in s.split() if len(t) > 2}
-    # buang token yang merupakan singkatan gelar umum
     gelar = {"mpd","msi","msc","sip","spi","spd","shum","se","mh","mm",
              "mmed","sppk","fisqua","amd","ma","st","dr","drs","sst","skm"}
     return tokens - gelar
 
 
 def resolve_pemateri(nama_pendek: str) -> str:
-    """
-    Cocokkan nama pendek dari filename ke nama lengkap di PEMATERI_LENGKAP.
-    Strategi:
-      1. Substring case-insensitive langsung
-      2. Token overlap — pilih nama lengkap dengan token overlap terbanyak
-    Kembalikan nama lengkap jika ditemukan, atau nama_pendek asli jika tidak.
-    """
     key = nama_pendek.strip().lower()
     if not key or key == "-":
         return nama_pendek
-
-    # Strategi 1: substring langsung
     for full in PEMATERI_LENGKAP:
         if key in full.lower():
             return full
-
-    # Strategi 2: cek apakah nama lengkap mengandung kata pertama nama pendek
-    # (berguna untuk "Indah" → "Indah Rachmawati, M.Pd.")
     key_tokens = _tokenize(key)
     if not key_tokens:
         return nama_pendek
-
     best_match = None
     best_score = 0
     for full in PEMATERI_LENGKAP:
@@ -536,33 +554,45 @@ def resolve_pemateri(nama_pendek: str) -> str:
         if overlap > best_score:
             best_score = overlap
             best_match = full
-
-    # Minimal 1 token harus cocok untuk dianggap match
     if best_score >= 1 and best_match:
         return best_match
-
-    return nama_pendek   # fallback: kembalikan apa adanya
+    return nama_pendek
 
 
 def normalize_platform(raw: str) -> str:
-    """
-    Ambil kata pertama saja, lalu jadikan UPPERCASE agar
-    'JADIASN', 'jadiasn', 'JadiASN' → 'JADIASN' (konsisten).
-    """
     word = raw.strip().split()[0] if raw.strip() else raw
     return word.strip().upper()
 
 
 def parse_filename(filename):
+    """
+    Parse nama file menjadi (platform, materi, pemateri).
+    FIX: Jika nama file tidak mengikuti konvensi NamaPlatform_Materi_Pemateri,
+    kembalikan data seadanya tanpa salah interpretasi.
+    """
     name  = os.path.splitext(filename)[0]
     name  = name.replace(" ", "_")
-    parts = [p for p in name.split("_") if p.strip()]
-    raw_platform = parts[0] if len(parts) > 0 else "-"
-    platform     = normalize_platform(raw_platform)
-    raw_pemateri = parts[-1].strip().replace("-", " ") if len(parts) > 2 else "-"
-    pemateri     = resolve_pemateri(raw_pemateri)
-    materi       = " ".join(p.strip() for p in parts[1:-1]).replace("-", " ") \
-                   if len(parts) > 2 else (parts[1].strip() if len(parts) > 1 else "-")
+    parts = [p.strip() for p in name.split("_") if p.strip()]
+
+    if len(parts) >= 3:
+        raw_platform = parts[0]
+        platform     = normalize_platform(raw_platform)
+        raw_pemateri = parts[-1].replace("-", " ")
+        pemateri     = resolve_pemateri(raw_pemateri)
+        materi       = " ".join(p.replace("-", " ") for p in parts[1:-1])
+    elif len(parts) == 2:
+        platform = normalize_platform(parts[0])
+        materi   = parts[1].replace("-", " ")
+        pemateri = "-"
+    elif len(parts) == 1:
+        platform = "-"
+        materi   = parts[0].replace("-", " ")
+        pemateri = "-"
+    else:
+        platform = "-"
+        materi   = filename
+        pemateri = "-"
+
     return platform, materi, pemateri
 
 
@@ -623,16 +653,77 @@ def stats_table(container, rows):
     </div>""", unsafe_allow_html=True)
 
 
+def hex_to_rgba(hex_color: str, alpha: float = 0.13) -> str:
+    hex_color = hex_color.lstrip("#")
+    r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def compute_unique_participants(df, m):
+    """
+    Hitung peserta unik vs total baris.
+    Banyak peserta Zoom re-join berkali-kali, sehingga total baris != peserta unik.
+    """
+    if "name" not in m:
+        return len(df), len(df), 0
+    total_rows   = len(df)
+    unique_names = df[m["name"]].nunique()
+    rejoin_rows  = total_rows - unique_names
+    return total_rows, unique_names, rejoin_rows
+
+
+def compute_effective_duration(df, m):
+    """
+    Hitung durasi efektif per peserta unik:
+    Jika seorang peserta join/leave berkali-kali, totalkan durasi mereka.
+    Return: DataFrame dengan kolom [Nama, Total_Durasi, Jumlah_Sesi]
+    """
+    if "name" not in m or "duration_p" not in m:
+        return None
+    grp = df.groupby(m["name"]).agg(
+        Total_Durasi = (m["duration_p"], "sum"),
+        Jumlah_Sesi  = (m["duration_p"], "count"),
+    ).reset_index()
+    grp.rename(columns={m["name"]: "Nama"}, inplace=True)
+    return grp.sort_values("Total_Durasi", ascending=False).reset_index(drop=True)
+
+
+def compute_retention_curve(df, m):
+    """
+    Hitung retention curve: berapa peserta yang masih online di setiap menit.
+    Berguna untuk melihat kapan peserta mulai banyak keluar.
+    """
+    if "join" not in m or "leave" not in m:
+        return None
+    sub = df[[m["join"], m["leave"]]].dropna()
+    if len(sub) == 0:
+        return None
+    sub[m["join"]]  = pd.to_datetime(sub[m["join"]],  errors="coerce")
+    sub[m["leave"]] = pd.to_datetime(sub[m["leave"]], errors="coerce")
+    sub = sub.dropna()
+    if len(sub) == 0:
+        return None
+
+    t_min = sub[m["join"]].min()
+    t_max = sub[m["leave"]].max()
+    total_minutes = int((t_max - t_min).total_seconds() / 60) + 1
+    total_minutes = min(total_minutes, 600)  # cap 10 jam
+
+    minutes = list(range(total_minutes))
+    counts  = []
+    for minute in minutes:
+        t = t_min + pd.Timedelta(minutes=minute)
+        online = ((sub[m["join"]] <= t) & (sub[m["leave"]] >= t)).sum()
+        counts.append(online)
+    return pd.DataFrame({"Menit": minutes, "Peserta_Online": counts})
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# BATCH LOADING: baca semua file dan buat summary dataframe
+# BATCH LOADING
 # ══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(show_spinner=False)
 def load_all_files(files_data):
-    """
-    files_data: list of (filename, bytes_content)
-    Return: list of dict dengan ringkasan tiap meeting
-    """
     records = []
     errors  = []
 
@@ -648,7 +739,12 @@ def load_all_files(files_data):
             m = detect_cols(df_raw)
             platform, materi, pemateri = parse_filename(fname)
 
-            # Konversi kolom datetime
+            # Jika topic tersedia dari data, gunakan sebagai fallback materi
+            if materi == "-" and "topic" in m:
+                topic_val = df_raw[m["topic"]].iloc[0] if len(df_raw) > 0 else "-"
+                if pd.notna(topic_val) and str(topic_val).strip():
+                    materi = str(topic_val).strip()
+
             for key in ["join", "leave", "start", "end"]:
                 if key in m:
                     df_raw[m[key]] = parse_dt(df_raw[m[key]])
@@ -657,12 +753,14 @@ def load_all_files(files_data):
             if "duration_m" in m:
                 df_raw[m["duration_m"]] = pd.to_numeric(df_raw[m["duration_m"]], errors="coerce")
 
-            # Hitung statistik ringkasan
             topic = df_raw[m["topic"]].iloc[0] if "topic" in m else fname
             host  = df_raw[m["host"]].iloc[0]  if "host"  in m else "-"
 
             n_peserta = int(df_raw[m["participants"]].iloc[0]) if "participants" in m and \
                 pd.notna(df_raw[m["participants"]].iloc[0]) else len(df_raw)
+
+            # Hitung peserta unik
+            _, unique_p, rejoin_rows = compute_unique_participants(df_raw, m)
 
             avg_dur = round(df_raw[m["duration_p"]].mean(), 1) if "duration_p" in m else None
             med_dur = round(df_raw[m["duration_p"]].median(), 1) if "duration_p" in m else None
@@ -682,22 +780,24 @@ def load_all_files(files_data):
             end_dt   = df_raw[m["end"]].iloc[0]   if "end"   in m and pd.notna(df_raw[m["end"]].iloc[0])   else None
 
             records.append({
-                "filename":    fname,
-                "platform":    platform,
-                "materi":      materi,
-                "pemateri":    pemateri,
-                "topic":       topic,
-                "host":        host,
-                "n_peserta":   n_peserta,
-                "avg_dur":     avg_dur,
-                "med_dur":     med_dur,
-                "dur_meeting": dur_meeting,
-                "comp_rate":   comp_rate,
-                "start_dt":    start_dt,
-                "end_dt":      end_dt,
-                "format":      fmt,
-                "_df":         df_raw,
-                "_m":          m,
+                "filename":     fname,
+                "platform":     platform,
+                "materi":       materi,
+                "pemateri":     pemateri,
+                "topic":        topic,
+                "host":         host,
+                "n_peserta":    n_peserta,
+                "unique_p":     unique_p,
+                "rejoin_rows":  rejoin_rows,
+                "avg_dur":      avg_dur,
+                "med_dur":      med_dur,
+                "dur_meeting":  dur_meeting,
+                "comp_rate":    comp_rate,
+                "start_dt":     start_dt,
+                "end_dt":       end_dt,
+                "format":       fmt,
+                "_df":          df_raw,
+                "_m":           m,
             })
         except Exception as e:
             errors.append((fname, str(e)))
@@ -721,7 +821,6 @@ with st.sidebar:
     format_type = "flat"
     batch_records = None
 
-    # ── Single file ──────────────────────────────────────────────────────────
     if mode == "Single File (CSV/XLSX)":
         f = st.file_uploader("Upload CSV/XLSX laporan Zoom", type=["csv", "xlsx"])
         if f:
@@ -743,7 +842,6 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Gagal: {e}")
 
-    # ── Multi file ───────────────────────────────────────────────────────────
     elif mode == "Multi File — Batch Dashboard":
         files = st.file_uploader(
             "Upload semua CSV/XLSX Zoom (pilih banyak)",
@@ -769,7 +867,6 @@ with st.sidebar:
                 for fn, err in batch_errors:
                     st.caption(f"• {fn}: {err}")
 
-    # ── URL ──────────────────────────────────────────────────────────────────
     else:
         url = st.text_input("URL CSV / Google Sheet:", placeholder="https://...")
         if st.button("Muat Data") and url:
@@ -805,7 +902,7 @@ with st.sidebar:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN — routing berdasarkan mode
+# MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 st.markdown("# 📊 Zoom Meeting Analyzer")
 st.caption("Dashboard analisis laporan peserta Zoom — Single & Batch Multi-Meeting.")
@@ -821,13 +918,13 @@ if mode == "Multi File — Batch Dashboard":
     df_sum = pd.DataFrame([{k: v for k, v in r.items() if not k.startswith("_")}
                             for r in batch_records])
 
-    # ── Tabs ──────────────────────────────────────────────────────────────────
-    tab_overview, tab_platform, tab_pemateri, tab_meeting, tab_peserta = st.tabs([
+    tab_overview, tab_platform, tab_pemateri, tab_meeting, tab_peserta, tab_compare = st.tabs([
         "🌐 Overview",
         "🏢 Per Platform",
         "🎓 Per Pemateri",
         "📋 Per Meeting",
         "👥 Gabungan Peserta",
+        "⚖️ Bandingkan Meeting",
     ])
 
     # ════════════════════════════════════════════════════════════════════════
@@ -838,6 +935,7 @@ if mode == "Multi File — Batch Dashboard":
 
         total_meetings  = len(df_sum)
         total_peserta   = int(df_sum["n_peserta"].sum())
+        total_unique    = int(df_sum["unique_p"].sum()) if "unique_p" in df_sum.columns else total_peserta
         avg_peserta     = round(df_sum["n_peserta"].mean(), 1)
         avg_comp        = round(df_sum["comp_rate"].dropna().mean(), 1) if df_sum["comp_rate"].notna().any() else 0
         avg_dur_all     = round(df_sum["avg_dur"].dropna().mean(), 1) if df_sum["avg_dur"].notna().any() else 0
@@ -852,7 +950,6 @@ if mode == "Multi File — Batch Dashboard":
         kpi(k5, "teal",   "⏱️", "Avg Durasi Peserta",   f"{avg_dur_all} mnt","rata-rata semua sesi")
         kpi(k6, "pink",   "🏢", "Platform / Pemateri",  f"{n_platform} / {n_pemateri}", "unik")
 
-        # Bar: peserta per meeting
         st.markdown('<div class="sec-title">👥 Jumlah Peserta per Meeting</div>', unsafe_allow_html=True)
         df_bar = df_sum.sort_values("n_peserta", ascending=True)
         label_list = [f"{r['platform']} — {r['materi'][:25]}" for _, r in df_bar.iterrows()]
@@ -871,7 +968,6 @@ if mode == "Multi File — Batch Dashboard":
         )
         st.plotly_chart(fig_bar, use_container_width=True)
 
-        # Scatter: peserta vs completion rate
         if df_sum["comp_rate"].notna().any():
             st.markdown('<div class="sec-title">📉 Peserta vs Completion Rate</div>', unsafe_allow_html=True)
             df_sc = df_sum.dropna(subset=["comp_rate"])
@@ -889,10 +985,17 @@ if mode == "Multi File — Batch Dashboard":
             fig_sc.update_traces(marker=dict(line=dict(color=BG_DARK, width=1)))
             st.plotly_chart(fig_sc, use_container_width=True)
 
-        # Tabel ringkasan
         st.markdown('<div class="sec-title">📋 Tabel Ringkasan Semua Meeting</div>', unsafe_allow_html=True)
-        tbl_sum = df_sum[["platform","materi","pemateri","n_peserta","avg_dur","comp_rate","dur_meeting"]].copy()
-        tbl_sum.columns = ["Platform","Materi","Pemateri","Peserta","Avg Durasi (mnt)","Completion (%)","Dur Meeting (mnt)"]
+        tbl_cols = ["platform","materi","pemateri","n_peserta","unique_p","avg_dur","comp_rate","dur_meeting"]
+        tbl_cols = [c for c in tbl_cols if c in df_sum.columns]
+        tbl_sum = df_sum[tbl_cols].copy()
+        col_rename = {
+            "platform": "Platform", "materi": "Materi", "pemateri": "Pemateri",
+            "n_peserta": "Peserta", "unique_p": "Peserta Unik",
+            "avg_dur": "Avg Durasi (mnt)", "comp_rate": "Completion (%)",
+            "dur_meeting": "Dur Meeting (mnt)",
+        }
+        tbl_sum.rename(columns={k: v for k, v in col_rename.items() if k in tbl_sum.columns}, inplace=True)
         st.dataframe(tbl_sum, use_container_width=True, height=360)
 
         st.download_button(
@@ -917,7 +1020,6 @@ if mode == "Multi File — Batch Dashboard":
         ).reset_index()
         plat_grp = plat_grp.sort_values("total_peserta", ascending=False)
 
-        # KPI per platform
         for _, row in plat_grp.iterrows():
             pa, pb, pc, pd_ = st.columns(4)
             pa.metric("Platform", row["platform"])
@@ -980,7 +1082,6 @@ if mode == "Multi File — Batch Dashboard":
             avg_comp       = ("comp_rate",   "mean"),
         ).reset_index().sort_values("avg_peserta", ascending=False).reset_index(drop=True)
 
-        # ── Tabel ranking pakai st.dataframe (aman, tidak ada HTML sanitasi) ──
         st.markdown('<div class="sec-title">🏅 Ranking Pemateri</div>', unsafe_allow_html=True)
         tbl_pm = pm_grp.copy()
         tbl_pm.index = tbl_pm.index + 1
@@ -998,7 +1099,6 @@ if mode == "Multi File — Batch Dashboard":
         }, inplace=True)
         st.dataframe(tbl_pm, use_container_width=True, height=min(600, 40 + len(tbl_pm) * 36))
 
-        # ── Chart 1: Avg Peserta per Pemateri ────────────────────────────────
         st.markdown('<div class="sec-title">📊 Chart Perbandingan Pemateri</div>', unsafe_allow_html=True)
         top_n = pm_grp.sort_values("avg_peserta", ascending=True).tail(20)
         fig_pm1 = go.Figure(go.Bar(
@@ -1018,7 +1118,6 @@ if mode == "Multi File — Batch Dashboard":
         )
         st.plotly_chart(fig_pm1, use_container_width=True)
 
-        # ── Chart 2: Total Peserta per Pemateri ──────────────────────────────
         top_tot = pm_grp.sort_values("total_peserta", ascending=True).tail(20)
         fig_pm3 = go.Figure(go.Bar(
             x=top_tot["total_peserta"],
@@ -1037,7 +1136,6 @@ if mode == "Multi File — Batch Dashboard":
         )
         st.plotly_chart(fig_pm3, use_container_width=True)
 
-        # ── Chart 3: Avg Completion Rate ─────────────────────────────────────
         pm_comp = pm_grp.dropna(subset=["avg_comp"])
         if len(pm_comp) > 0:
             top_c = pm_comp.sort_values("avg_comp", ascending=True).tail(20)
@@ -1062,7 +1160,7 @@ if mode == "Multi File — Batch Dashboard":
             st.plotly_chart(fig_pm2, use_container_width=True)
 
     # ════════════════════════════════════════════════════════════════════════
-    # TAB 4 — PER MEETING (pilih dari dropdown)
+    # TAB 4 — PER MEETING
     # ════════════════════════════════════════════════════════════════════════
     with tab_meeting:
         st.markdown('<div class="sec-title">📋 Detail per Meeting</div>', unsafe_allow_html=True)
@@ -1076,7 +1174,6 @@ if mode == "Multi File — Batch Dashboard":
         df  = rec["_df"]
         m   = rec["_m"]
 
-        # Banner
         topic     = df[m["topic"]].iloc[0] if "topic" in m else rec["materi"]
         host      = df[m["host"]].iloc[0]  if "host"  in m else "-"
         start_val = df[m["start"]].iloc[0] if "start" in m else None
@@ -1096,10 +1193,10 @@ if mode == "Multi File — Batch Dashboard":
         </div>
         """, unsafe_allow_html=True)
 
-        # KPI
         avg_dur = round(df[m["duration_p"]].mean(), 1) if "duration_p" in m else 0
-        comp_rate = f"{rec['comp_rate']}%" if rec["comp_rate"] is not None else "N/A"
+        comp_rate_str = f"{rec['comp_rate']}%" if rec["comp_rate"] is not None else "N/A"
         comp_sub  = f"dari {rec['n_peserta']} peserta"
+        _, unique_p_meeting, rejoin_meeting = compute_unique_participants(df, m)
 
         if start_val is not None and end_val is not None and pd.notna(start_val) and pd.notna(end_val):
             total_sec = max(int((end_val - start_val).total_seconds()), 0)
@@ -1114,13 +1211,13 @@ if mode == "Multi File — Batch Dashboard":
         else:
             durasi_str, durasi_sub = "--:--:--", "data tidak tersedia"
 
-        k1, k2, k3, k4 = st.columns(4)
-        kpi(k1, "blue",   "👥", "Total Peserta",       rec["n_peserta"],   "orang terdaftar")
-        kpi(k2, "green",  "⏱️", "Durasi Meeting",       durasi_str,         durasi_sub)
-        kpi(k3, "amber",  "📈", "Rata-rata Durasi",     f"{avg_dur} mnt",   "per peserta")
-        kpi(k4, "purple", "✅", "Completion Rate ≥80%", comp_rate,          comp_sub)
+        k1, k2, k3, k4, k5 = st.columns(5)
+        kpi(k1, "blue",   "👥", "Total Peserta",       rec["n_peserta"],       "baris data")
+        kpi(k2, "teal",   "🧑", "Peserta Unik",        unique_p_meeting,       f"{rejoin_meeting} re-join")
+        kpi(k3, "green",  "⏱️", "Durasi Meeting",       durasi_str,             durasi_sub)
+        kpi(k4, "amber",  "📈", "Rata-rata Durasi",     f"{avg_dur} mnt",       "per peserta")
+        kpi(k5, "purple", "✅", "Completion Rate ≥80%", comp_rate_str,          comp_sub)
 
-        # Distribusi durasi
         if "duration_p" in m:
             dur = df[m["duration_p"]].dropna()
             if len(dur) > 0:
@@ -1153,7 +1250,6 @@ if mode == "Multi File — Batch Dashboard":
                     fig_box.update_layout(showlegend=False, yaxis_title="Menit")
                     st.plotly_chart(fig_box, use_container_width=True)
 
-        # Tabel peserta
         st.markdown('<div class="sec-title">📋 Data Peserta</div>', unsafe_allow_html=True)
         display_keys = ["name","email","join","leave","duration_p","guest","waiting","disclaimer"]
         rename_map   = {
@@ -1171,7 +1267,7 @@ if mode == "Multi File — Batch Dashboard":
         st.dataframe(tbl, use_container_width=True, height=320)
 
     # ════════════════════════════════════════════════════════════════════════
-    # TAB 5 — GABUNGAN PESERTA (semua meeting digabung)
+    # TAB 5 — GABUNGAN PESERTA
     # ════════════════════════════════════════════════════════════════════════
     with tab_peserta:
         st.markdown('<div class="sec-title">👥 Data Gabungan Semua Peserta</div>', unsafe_allow_html=True)
@@ -1194,7 +1290,6 @@ if mode == "Multi File — Batch Dashboard":
         if all_rows:
             df_all = pd.concat(all_rows, ignore_index=True)
 
-            # Frekuensi kehadiran per peserta
             st.markdown('<div class="sec-title">🔢 Frekuensi Kehadiran (Top 30)</div>', unsafe_allow_html=True)
             freq = df_all.groupby("Nama").agg(
                 Sesi_Dihadiri = ("Materi", "count"),
@@ -1213,7 +1308,6 @@ if mode == "Multi File — Batch Dashboard":
             fig_freq.update_layout(xaxis_title="Nama", yaxis_title="Jumlah Sesi", xaxis_tickangle=-45)
             st.plotly_chart(fig_freq, use_container_width=True)
 
-            # Tabel gabungan
             st.markdown('<div class="sec-title">📋 Tabel Semua Peserta (Gabungan)</div>', unsafe_allow_html=True)
             search2 = st.text_input("🔍 Cari nama / email:", "", key="search_gabungan")
             tbl_all = df_all.copy()
@@ -1236,11 +1330,301 @@ if mode == "Multi File — Batch Dashboard":
         else:
             st.warning("Tidak ada data peserta yang dapat digabung (kolom nama tidak ditemukan).")
 
-    st.stop()  # ← tidak lanjut ke blok single-file
+    # ════════════════════════════════════════════════════════════════════════
+    # TAB 6 — BANDINGKAN MEETING
+    # ════════════════════════════════════════════════════════════════════════
+    with tab_compare:
+        st.markdown('<div class="sec-title">⚖️ Perbandingan Antar Meeting</div>', unsafe_allow_html=True)
+
+        meeting_labels = [
+            f"{r['platform']} | {r['materi'][:30]} | {r['pemateri'].split(',')[0]}"
+            for r in batch_records
+        ]
+        selected_compare = st.multiselect(
+            "Pilih 2–5 meeting untuk dibandingkan:",
+            options=range(len(meeting_labels)),
+            format_func=lambda i: meeting_labels[i],
+            default=list(range(min(3, len(batch_records)))),
+            max_selections=5,
+        )
+
+        if len(selected_compare) < 2:
+            st.info("Pilih minimal 2 meeting untuk memulai perbandingan.")
+            st.stop()
+
+        recs_sel = [batch_records[i] for i in selected_compare]
+        labels   = [
+            f"{r['platform']}\n{r['materi'][:20]}"
+            for r in recs_sel
+        ]
+        short_labels = [
+            f"{r['platform']} – {r['materi'][:18]}"
+            for r in recs_sel
+        ]
+
+        st.markdown('<div class="sec-title">📌 KPI Setiap Meeting</div>', unsafe_allow_html=True)
+        kpi_cols = st.columns(len(recs_sel))
+        accent_list = ["blue", "green", "amber", "purple", "teal"]
+        for col, rec, acc in zip(kpi_cols, recs_sel, accent_list):
+            comp_str = f"{rec['comp_rate']}%" if rec["comp_rate"] is not None else "N/A"
+            avg_str  = f"{rec['avg_dur']} mnt" if rec["avg_dur"] is not None else "N/A"
+            col.markdown(f"""
+            <div class="kpi-card {acc}" style="min-height:160px;">
+              <h4>🏢 {rec['platform']}</h4>
+              <div style="font-size:0.78rem;color:{TEXT_MUTED};margin-bottom:8px;line-height:1.3;">
+                {rec['materi'][:28]}<br>{rec['pemateri'].split(',')[0]}
+              </div>
+              <div style="display:flex;gap:16px;flex-wrap:wrap;">
+                <div><div class="ksub">Peserta</div><div style="font-size:1.3rem;font-weight:800;color:{TEXT_PRIMARY};">{rec['n_peserta']}</div></div>
+                <div><div class="ksub">Completion</div><div style="font-size:1.3rem;font-weight:800;color:{TEXT_PRIMARY};">{comp_str}</div></div>
+                <div><div class="ksub">Avg Durasi</div><div style="font-size:1.3rem;font-weight:800;color:{TEXT_PRIMARY};">{avg_str}</div></div>
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        st.markdown('<div class="sec-title">📊 Perbandingan Jumlah Peserta & Completion Rate</div>', unsafe_allow_html=True)
+        c1, c2 = st.columns(2)
+
+        with c1:
+            fig_cp1 = go.Figure(go.Bar(
+                x=short_labels,
+                y=[r["n_peserta"] for r in recs_sel],
+                marker_color=PLATFORM_COLORS[:len(recs_sel)],
+                text=[r["n_peserta"] for r in recs_sel],
+                textposition="outside",
+                textfont=dict(color=TEXT_PRIMARY, size=12),
+                marker_line_color=BG_DARK, marker_line_width=1,
+            ))
+            dark_chart(fig_cp1, height=320, title="Jumlah Peserta")
+            fig_cp1.update_layout(
+                xaxis_title="Meeting", yaxis_title="Peserta",
+                xaxis_tickangle=-20,
+            )
+            st.plotly_chart(fig_cp1, use_container_width=True)
+
+        with c2:
+            comp_vals = [r["comp_rate"] if r["comp_rate"] is not None else 0 for r in recs_sel]
+            fig_cp2 = go.Figure(go.Bar(
+                x=short_labels,
+                y=comp_vals,
+                marker_color=[
+                    ACCENT_GREEN if v >= 70 else ACCENT_AMBER if v >= 50 else ACCENT_RED
+                    for v in comp_vals
+                ],
+                text=[f"{v:.1f}%" for v in comp_vals],
+                textposition="outside",
+                textfont=dict(color=TEXT_PRIMARY, size=12),
+                marker_line_color=BG_DARK, marker_line_width=1,
+            ))
+            dark_chart(fig_cp2, height=320, title="Completion Rate ≥80% (%)")
+            fig_cp2.update_layout(
+                xaxis_title="Meeting", yaxis_title="Completion Rate (%)",
+                xaxis_tickangle=-20,
+                yaxis=dict(range=[0, max(comp_vals + [100]) * 1.15]),
+            )
+            fig_cp2.add_hline(
+                y=70, line_dash="dot", line_color=ACCENT_GREEN,
+                annotation_text="Target 70%",
+                annotation_font_color=ACCENT_GREEN,
+            )
+            st.plotly_chart(fig_cp2, use_container_width=True)
+
+        has_dur = any("duration_p" in r["_m"] for r in recs_sel)
+        if has_dur:
+            st.markdown('<div class="sec-title">⏱️ Overlay Distribusi Durasi Peserta</div>', unsafe_allow_html=True)
+            fig_ov = go.Figure()
+            for rec, color, sl in zip(recs_sel, PLATFORM_COLORS, short_labels):
+                m_i = rec["_m"]
+                if "duration_p" not in m_i:
+                    continue
+                dur_i = pd.to_numeric(rec["_df"][m_i["duration_p"]], errors="coerce").dropna()
+                if len(dur_i) == 0:
+                    continue
+                fig_ov.add_trace(go.Histogram(
+                    x=dur_i, name=sl, nbinsx=25,
+                    opacity=0.6,
+                    marker_color=color,
+                    marker_line_color=BG_DARK, marker_line_width=0.8,
+                ))
+            fig_ov.update_layout(**DARK_LAYOUT)
+            fig_ov.update_layout(
+                barmode="overlay",
+                height=340,
+                title=dict(text="Overlay Distribusi Durasi (menit)", font=dict(size=14, color=TEXT_PRIMARY)),
+                xaxis_title="Durasi (menit)",
+                yaxis_title="Jumlah Peserta",
+                legend=dict(
+                    font=dict(color=TEXT_MUTED, size=11),
+                    bgcolor="rgba(0,0,0,0)",
+                    orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1,
+                ),
+            )
+            st.plotly_chart(fig_ov, use_container_width=True)
+
+            st.markdown('<div class="sec-title">📦 Box Plot Durasi (Berdampingan)</div>', unsafe_allow_html=True)
+            fig_box2 = go.Figure()
+            for rec, color, sl in zip(recs_sel, PLATFORM_COLORS, short_labels):
+                m_i = rec["_m"]
+                if "duration_p" not in m_i:
+                    continue
+                dur_i = pd.to_numeric(rec["_df"][m_i["duration_p"]], errors="coerce").dropna()
+                if len(dur_i) == 0:
+                    continue
+                fig_box2.add_trace(go.Box(
+                    y=dur_i, name=sl,
+                    marker_color=color, line_color=color,
+                    fillcolor=hex_to_rgba(color, 0.18),
+                    boxmean="sd", notched=False, whiskerwidth=0.6,
+                ))
+            fig_box2.update_layout(**DARK_LAYOUT)
+            fig_box2.update_layout(
+                height=340,
+                title=dict(text="Box Plot Durasi per Meeting", font=dict(size=14, color=TEXT_PRIMARY)),
+                yaxis_title="Durasi (menit)",
+                showlegend=False,
+            )
+            st.plotly_chart(fig_box2, use_container_width=True)
+
+        # Radar Chart
+        st.markdown('<div class="sec-title">🕸️ Radar Chart Perbandingan Multi-Dimensi</div>', unsafe_allow_html=True)
+
+        radar_dims = ["Peserta", "Avg Durasi (mnt)", "Completion (%)", "Dur Meeting (mnt)"]
+
+        raw_values = {
+            "Peserta":             [r["n_peserta"]          or 0 for r in recs_sel],
+            "Avg Durasi (mnt)":    [r["avg_dur"]            or 0 for r in recs_sel],
+            "Completion (%)":      [r["comp_rate"]          or 0 for r in recs_sel],
+            "Dur Meeting (mnt)":   [r["dur_meeting"]        or 0 for r in recs_sel],
+        }
+
+        def norm_dim(vals):
+            arr  = np.array(vals, dtype=float)
+            mn, mx = arr.min(), arr.max()
+            if mx == mn:
+                return [50.0] * len(vals)
+            return ((arr - mn) / (mx - mn) * 100).tolist()
+
+        normed = {dim: norm_dim(raw_values[dim]) for dim in radar_dims}
+
+        with st.expander("🔍 Debug nilai radar (klik untuk lihat)", expanded=False):
+            debug_rows = []
+            for i, (rec, sl) in enumerate(zip(recs_sel, short_labels)):
+                row = {"Meeting": sl}
+                for dim in radar_dims:
+                    row[f"{dim} (raw)"]    = raw_values[dim][i]
+                    row[f"{dim} (normed)"] = round(normed[dim][i], 1)
+                debug_rows.append(row)
+            st.dataframe(pd.DataFrame(debug_rows), use_container_width=True)
+
+        fig_radar = go.Figure()
+        for i, (rec, color, sl) in enumerate(zip(recs_sel, PLATFORM_COLORS, short_labels)):
+            vals        = [normed[dim][i] for dim in radar_dims]
+            vals_closed = vals + [vals[0]]
+            dims_closed = radar_dims + [radar_dims[0]]
+
+            raw_txt = "<br>".join(
+                f"{dim}: {raw_values[dim][i]}"
+                for dim in radar_dims
+            )
+
+            fig_radar.add_trace(go.Scatterpolar(
+                r=vals_closed,
+                theta=dims_closed,
+                fill="toself",
+                name=sl,
+                line=dict(color=color, width=2),
+                fillcolor=hex_to_rgba(color, 0.15),
+                opacity=0.9,
+                hovertemplate=f"<b>{sl}</b><br>{raw_txt}<extra></extra>",
+            ))
+
+        fig_radar.update_layout(
+            paper_bgcolor=BG_CARD,
+            plot_bgcolor=BG_CARD,
+            polar=dict(
+                bgcolor=BG_CARD2,
+                radialaxis=dict(
+                    visible=True,
+                    range=[0, 100],
+                    gridcolor=BORDER,
+                    linecolor=BORDER,
+                    tickfont=dict(color=TEXT_MUTED, size=9),
+                    tickvals=[0, 25, 50, 75, 100],
+                    ticktext=["0", "25", "50", "75", "100"],
+                    tickangle=45,
+                ),
+                angularaxis=dict(
+                    gridcolor=BORDER,
+                    linecolor=BORDER,
+                    tickfont=dict(color=TEXT_PRIMARY, size=12),
+                ),
+            ),
+            font=dict(color=TEXT_PRIMARY, size=12),
+            legend=dict(
+                font=dict(color=TEXT_MUTED, size=11),
+                bgcolor="rgba(0,0,0,0)",
+                orientation="h",
+                yanchor="bottom", y=-0.25,
+                xanchor="center", x=0.5,
+            ),
+            height=480,
+            title=dict(
+                text="Radar: Perbandingan Relatif per Dimensi (0–100, dinormalisasi per-dimensi)",
+                font=dict(size=13, color=TEXT_MUTED),
+            ),
+            margin=dict(t=70, b=100, l=80, r=80),
+        )
+        st.plotly_chart(fig_radar, use_container_width=True)
+
+        st.caption(
+            "ℹ️ Nilai dinormalisasi **per dimensi** secara independen — "
+            "nilai tertinggi di tiap dimensi = 100, terendah = 0. "
+            "Hover pada chart untuk melihat nilai asli."
+        )
+
+        # Tabel Delta
+        st.markdown('<div class="sec-title">📐 Tabel Perbandingan & Delta</div>', unsafe_allow_html=True)
+
+        base_rec = recs_sel[0]
+
+        def fmt_delta(val, base):
+            if val is None or base is None:
+                return "-"
+            delta = val - base
+            sign  = "+" if delta >= 0 else ""
+            return f"{sign}{delta:.1f}"
+
+        tbl_rows = []
+        for rec in recs_sel:
+            tbl_rows.append({
+                "Meeting":        f"{rec['platform']} | {rec['materi'][:22]}",
+                "Pemateri":       rec["pemateri"].split(",")[0],
+                "Peserta":        rec["n_peserta"],
+                "Δ Peserta":      fmt_delta(rec["n_peserta"],   base_rec["n_peserta"]),
+                "Avg Durasi":     f"{rec['avg_dur']} mnt"  if rec["avg_dur"]   is not None else "-",
+                "Δ Avg Dur":      fmt_delta(rec["avg_dur"],     base_rec["avg_dur"]),
+                "Completion %":   f"{rec['comp_rate']}%"    if rec["comp_rate"] is not None else "-",
+                "Δ Completion":   fmt_delta(rec["comp_rate"],   base_rec["comp_rate"]),
+                "Dur Meeting":    f"{rec['dur_meeting']} mnt" if rec["dur_meeting"] is not None else "-",
+            })
+
+        df_delta = pd.DataFrame(tbl_rows)
+        st.caption(f"Δ dihitung relatif terhadap meeting pertama: **{short_labels[0]}**")
+        st.dataframe(df_delta, use_container_width=True, height=min(420, 60 + len(df_delta) * 40))
+
+        st.download_button(
+            "⬇️ Download Tabel Perbandingan CSV",
+            data=df_delta.to_csv(index=False).encode("utf-8"),
+            file_name="zoom_meeting_compare.csv",
+            mime="text/csv",
+        )
+
+    st.stop()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MODE SINGLE FILE (kode asli + perbaikan kecil)
+# MODE SINGLE FILE
 # ─────────────────────────────────────────────────────────────────────────────
 if df_raw is None:
     st.info("👈 Upload file CSV/XLSX atau masukkan link URL di sidebar untuk memulai.")
@@ -1261,6 +1645,13 @@ if "participants" in m:
     df[m["participants"]] = pd.to_numeric(df[m["participants"]], errors="coerce")
 
 platform, materi, pemateri = parse_filename(filename)
+
+# Fallback: jika parse_filename gagal dapat materi, ambil dari data
+if materi == "-" or materi == filename:
+    if "topic" in m:
+        topic_val = df[m["topic"]].iloc[0]
+        if pd.notna(topic_val) and str(topic_val).strip():
+            materi = str(topic_val).strip()
 
 # ── Banner ────────────────────────────────────────────────────────────────────
 topic     = df[m["topic"]].iloc[0] if "topic" in m else "Meeting"
@@ -1290,6 +1681,7 @@ if "participants" in m:
 else:
     total_p = len(df)
 
+_, unique_p, rejoin_count = compute_unique_participants(df, m)
 avg_dur = round(df[m["duration_p"]].mean(), 1) if "duration_p" in m else 0
 
 if "duration_p" in m and "duration_m" in m:
@@ -1323,11 +1715,12 @@ elif "duration_m" in m:
 else:
     durasi_str, durasi_sub = "--:--:--", "data tidak tersedia"
 
-k1, k2, k3, k4 = st.columns(4)
+k1, k2, k3, k4, k5 = st.columns(5)
 kpi(k1, "blue",   "👥", "Total Peserta",       total_p,          "orang terdaftar")
-kpi(k2, "green",  "⏱️", "Durasi Meeting",       durasi_str,       durasi_sub)
-kpi(k3, "amber",  "📈", "Rata-rata Durasi",     f"{avg_dur} mnt", "per peserta")
-kpi(k4, "purple", "✅", "Completion Rate ≥80%", comp_rate,        comp_sub)
+kpi(k2, "teal",   "🧑", "Peserta Unik",        unique_p,         f"{rejoin_count} re-join")
+kpi(k3, "green",  "⏱️", "Durasi Meeting",       durasi_str,       durasi_sub)
+kpi(k4, "amber",  "📈", "Rata-rata Durasi",     f"{avg_dur} mnt", "per peserta")
+kpi(k5, "purple", "✅", "Completion Rate ≥80%", comp_rate,        comp_sub)
 
 # ── Statistik Deskriptif ──────────────────────────────────────────────────────
 if "duration_p" in m:
@@ -1336,20 +1729,21 @@ if "duration_p" in m:
     dur = df[m["duration_p"]].dropna()
     if len(dur) > 0:
         all_stats = [
-            ("Jumlah Peserta",   f"{int(dur.count())}"),
-            ("Minimum",          f"{dur.min():.0f} mnt"),
-            ("Maksimum",         f"{dur.max():.0f} mnt"),
-            ("Rata-rata (Mean)", f"{dur.mean():.1f} mnt"),
-            ("Median (Q2)",      f"{dur.median():.1f} mnt"),
-            ("Modus",            f"{dur.mode().iloc[0]:.0f} mnt"),
-            ("Std. Deviasi",     f"{dur.std():.1f} mnt"),
-            ("Q1 (25%)",         f"{dur.quantile(0.25):.1f} mnt"),
-            ("Q3 (75%)",         f"{dur.quantile(0.75):.1f} mnt"),
-            ("IQR",              f"{dur.quantile(0.75) - dur.quantile(0.25):.1f} mnt"),
-            ("Skewness",         f"{dur.skew():.3f}"),
-            ("Kurtosis",         f"{dur.kurt():.3f}"),
+            ("Jumlah Baris Data",   f"{int(dur.count())}"),
+            ("Peserta Unik",        f"{unique_p}"),
+            ("Minimum",             f"{dur.min():.0f} mnt"),
+            ("Maksimum",            f"{dur.max():.0f} mnt"),
+            ("Rata-rata (Mean)",    f"{dur.mean():.1f} mnt"),
+            ("Median (Q2)",         f"{dur.median():.1f} mnt"),
+            ("Modus",               f"{dur.mode().iloc[0]:.0f} mnt"),
+            ("Std. Deviasi",        f"{dur.std():.1f} mnt"),
+            ("Q1 (25%)",            f"{dur.quantile(0.25):.1f} mnt"),
+            ("Q3 (75%)",            f"{dur.quantile(0.75):.1f} mnt"),
+            ("IQR",                 f"{dur.quantile(0.75) - dur.quantile(0.25):.1f} mnt"),
+            ("Skewness",            f"{dur.skew():.3f}"),
+            ("Kurtosis",            f"{dur.kurt():.3f}"),
         ]
-        half = len(all_stats) // 2
+        half = len(all_stats) // 2 + 1
         cs1, cs2 = st.columns(2)
         stats_table(cs1, all_stats[:half])
         stats_table(cs2, all_stats[half:])
@@ -1419,6 +1813,88 @@ with col_b:
             st.warning("Data waktu bergabung tidak tersedia.")
     else:
         st.warning("Kolom waktu bergabung tidak ditemukan.")
+
+# ── Retention Curve (BARU) ────────────────────────────────────────────────────
+st.markdown('<div class="sec-title">📈 Kurva Retensi Peserta</div>', unsafe_allow_html=True)
+retention_df = compute_retention_curve(df, m)
+if retention_df is not None and len(retention_df) > 0:
+    peak_online  = retention_df["Peserta_Online"].max()
+    peak_minute  = retention_df.loc[retention_df["Peserta_Online"].idxmax(), "Menit"]
+
+    fig_ret = go.Figure()
+    fig_ret.add_trace(go.Scatter(
+        x=retention_df["Menit"], y=retention_df["Peserta_Online"],
+        mode="lines",
+        fill="tozeroy",
+        line=dict(color=ACCENT_BLUE, width=2),
+        fillcolor=hex_to_rgba(ACCENT_BLUE, 0.15),
+        name="Peserta Online",
+        hovertemplate="Menit ke-%{x}<br>Peserta online: %{y}<extra></extra>",
+    ))
+    fig_ret.add_vline(
+        x=peak_minute, line_dash="dot", line_color=ACCENT_AMBER,
+        annotation_text=f"Peak: {peak_online} (menit {peak_minute})",
+        annotation_font_color=ACCENT_AMBER,
+        annotation_font_size=11,
+    )
+    dark_chart(fig_ret, height=320, title="Kurva Retensi: Jumlah Peserta Online per Menit")
+    fig_ret.update_layout(
+        xaxis_title="Menit sejak meeting dimulai",
+        yaxis_title="Peserta Online",
+    )
+    st.plotly_chart(fig_ret, use_container_width=True)
+
+    st.markdown(f"""
+    <div class="insight-card">
+        💡 <b>Insight Retensi:</b> Peak peserta online: <b>{peak_online}</b> orang pada menit ke-<b>{peak_minute}</b>.
+        Di akhir meeting, tersisa <b>{retention_df["Peserta_Online"].iloc[-1]}</b> peserta.
+    </div>
+    """, unsafe_allow_html=True)
+else:
+    st.caption("Data waktu bergabung/keluar tidak tersedia untuk analisis retensi.")
+
+# ── Durasi Efektif per Peserta Unik (BARU) ───────────────────────────────────
+eff_dur = compute_effective_duration(df, m)
+if eff_dur is not None and len(eff_dur) > 0:
+    multi_session = eff_dur[eff_dur["Jumlah_Sesi"] > 1]
+    if len(multi_session) > 0:
+        st.markdown('<div class="sec-title">🔄 Peserta dengan Multiple Sesi (Re-join)</div>',
+                    unsafe_allow_html=True)
+
+        st.markdown(f"""
+        <div class="insight-card">
+            💡 <b>{len(multi_session)}</b> peserta unik tercatat join lebih dari sekali
+            (dari total <b>{len(eff_dur)}</b> peserta unik).
+            Ini bisa berarti koneksi terputus, atau peserta keluar-masuk selama meeting.
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Tampilkan top 20 re-joiner
+        top_rejoin = multi_session.sort_values("Jumlah_Sesi", ascending=False).head(20)
+        c1, c2 = st.columns(2)
+        with c1:
+            fig_rj = go.Figure(go.Bar(
+                x=top_rejoin["Nama"].str[:25], y=top_rejoin["Jumlah_Sesi"],
+                marker_color=ACCENT_AMBER,
+                text=top_rejoin["Jumlah_Sesi"], textposition="outside",
+                textfont=dict(color=TEXT_PRIMARY, size=10),
+                marker_line_color=BG_DARK, marker_line_width=1,
+            ))
+            dark_chart(fig_rj, height=320, title="Top 20 Peserta Re-join (Jumlah Sesi)")
+            fig_rj.update_layout(xaxis_tickangle=-45, xaxis_title="Nama", yaxis_title="Jumlah Sesi")
+            st.plotly_chart(fig_rj, use_container_width=True)
+        with c2:
+            fig_rj2 = go.Figure(go.Bar(
+                x=top_rejoin["Nama"].str[:25], y=top_rejoin["Total_Durasi"],
+                marker_color=ACCENT_TEAL,
+                text=[f"{v:.0f}" for v in top_rejoin["Total_Durasi"]],
+                textposition="outside",
+                textfont=dict(color=TEXT_PRIMARY, size=10),
+                marker_line_color=BG_DARK, marker_line_width=1,
+            ))
+            dark_chart(fig_rj2, height=320, title="Top 20 Peserta Re-join (Total Durasi mnt)")
+            fig_rj2.update_layout(xaxis_tickangle=-45, xaxis_title="Nama", yaxis_title="Total Durasi (mnt)")
+            st.plotly_chart(fig_rj2, use_container_width=True)
 
 # ── Pie Charts ────────────────────────────────────────────────────────────────
 st.markdown('<div class="sec-title">📋 Analisis Status Peserta</div>', unsafe_allow_html=True)
@@ -1541,4 +2017,4 @@ st.download_button(
 )
 
 st.markdown("---")
-st.caption("Zoom Meeting Analyzer v2 · Dibuat dengan Streamlit & Plotly")
+st.caption("Zoom Meeting Analyzer v3 · Dibuat dengan Streamlit & Plotly")
